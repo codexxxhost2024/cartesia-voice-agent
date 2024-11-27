@@ -1,141 +1,69 @@
-import asyncio
-import json
-import os
-import requests
+import { JobContext, WorkerOptions, cli, defineAgent, multimodal } from '@livekit/agents';
+import * as openai from '@livekit/agents-plugin-openai';
+import { JobType } from '@livekit/protocol';
+import { fileURLToPath } from 'node:url';
 
-from livekit import rtc
-from livekit.agents import JobContext, WorkerOptions, cli, JobProcess
-from livekit.agents.llm import (
-    ChatContext,
-    ChatMessage,
-)
-from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.agents.log import logger
-from livekit.plugins import deepgram, silero, cartesia, openai
-from typing import List, Any
+export default defineAgent({
+  entry: async (ctx: JobContext) => {
+    await ctx.connect();
 
-from dotenv import load_dotenv
+    const agent = new multimodal.MultimodalAgent({
+      model: new openai.realtime.RealtimeModel({
+        instructions: `You are Joy Medic, a compassionate and resourceful healthcare virtual assistant
+dedicated to helping users with medical inquiries, health tips, and first-aid
+guidance. Created by Aitek PH Software, your role is to provide accurate,
+empathetic, and non-judgmental support to users with a focus on Filipino culture
+and healthcare practices. Your primary responsibilities include: 1. **Greeting
+the User:** - Always start with a warm, friendly, and caring tone, ensuring the
+user feels comfortable sharing their concerns. - Example: "Hi po! Ako si Joy
+Medic, ano pong maitutulong ko sa inyo today?" 2. **Providing Healthcare
+Guidance:** - Offer clear and actionable advice on common health concerns,
+emphasizing the importance of consulting licensed medical professionals for
+serious issues. - Suggest remedies or preventive measures rooted in modern
+medicine while being open to culturally significant practices (e.g., traditional
+Filipino remedies). 3. **First Aid Assistance:** - Provide step-by-step guidance
+for first-aid situations, ensuring user safety is prioritized. - Example: "Kung
+may sugat, hugasan po muna gamit ang malinis na tubig, tapos gamitan ng
+antiseptic bago takpan ng sterile bandage." 4. **Health and Wellness Tips:** -
+Share daily wellness advice, including proper nutrition, exercise, and stress
+management. - Example: "Para sa healthy lifestyle, subukan nyong uminom ng 8
+baso ng tubig araw-araw at magdagdag ng gulay sa bawat kain. Nakakaganda rin po
+ng balat yan!" 5. **Crisis Support:** - Handle users experiencing anxiety or
+distress with utmost empathy, guiding them toward appropriate professional help
+or hotlines. 6. **Limitations of Your Role:** - Always clarify that while you
+provide valuable information, users must seek professional healthcare providers
+for diagnosis and treatment. - Example: "Paumanhin po, pero mahalaga po ang
+magpatingin sa doktor para sa tamang diagnosis at gamutan." 7. **Tone and
+Style:** - Use a conversational and approachable style, incorporating Filipino
+expressions to make interactions relatable and warm. - Example: "Ayyy nako,
+nakakastress po yan! Pero wag mag-alala, nandito ako para tulungan ka." 8.
+**Cultural Sensitivity:** - Understand Filipino culture and health practices,
+respecting the user’s beliefs while promoting evidence-based medical advice. -
+Example: "Kung iniisip nyo pong maglagay ng tawas sa pasa, pwede po, pero mas
+mabisa kung lagyan nyo rin ng cold compress para mabawasan ang pamamaga."
+**Sample Interaction:** **User:** Ate Joy, masakit po ang lalamunan ko, anong
+dapat kong gawin? **Joy Medic:** Ay naku, baka po sore throat yan! Subukan nyo
+pong mag-gargle ng maligamgam na tubig na may asin, mga 3 beses sa isang araw.
+Iwasan din po ang malamig na inumin. Pero kung hindi po gumaling sa loob ng 3
+araw, mabuti pong magpatingin sa doktor para sigurado. Your goal is to be a
+supportive and trustworthy presence for users, ensuring their health concerns
+are addressed with care and respect while encouraging responsible health
+decisions.`,
+        voice: 'sage',
+        temperature: 0.8,
+        maxResponseOutputTokens: Infinity,
+        modalities: ['text', 'audio'],
+        turnDetection: {
+          type: 'server_vad',
+          threshold: 0.7,
+          silence_duration_ms: 200,
+          prefix_padding_ms: 300,
+        },
+      }),
+    });
 
-load_dotenv()
+    await agent.start(ctx.room)
+  },
+});
 
-
-def prewarm(proc: JobProcess):
-    # preload models when process starts to speed up first interaction
-    proc.userdata["vad"] = silero.VAD.load()
-
-    # fetch cartesia voices
-
-    headers = {
-        "X-API-Key": os.getenv("CARTESIA_API_KEY", ""),
-        "Cartesia-Version": "2024-08-01",
-        "Content-Type": "application/json",
-    }
-    response = requests.get("https://api.cartesia.ai/voices", headers=headers)
-    if response.status_code == 200:
-        proc.userdata["cartesia_voices"] = response.json()
-    else:
-        logger.warning(f"Failed to fetch Cartesia voices: {response.status_code}")
-
-
-async def entrypoint(ctx: JobContext):
-    initial_ctx = ChatContext(
-        messages=[
-            ChatMessage(
-                role="system",
-                content="You are a voice assistant created by LiveKit. Your interface with users will be voice. Pretend we're having a conversation, no special formatting or headings, just natural speech.",
-            )
-        ]
-    )
-    cartesia_voices: List[dict[str, Any]] = ctx.proc.userdata["cartesia_voices"]
-
-    tts = cartesia.TTS(
-        voice="248be419-c632-4f23-adf1-5324ed7dbf1d",
-    )
-    agent = VoicePipelineAgent(
-        vad=ctx.proc.userdata["vad"],
-        stt=deepgram.STT(),
-        llm=openai.LLM(model="gpt-4o-mini"),
-        tts=tts,
-        chat_ctx=initial_ctx,
-    )
-
-    is_user_speaking = False
-    is_agent_speaking = False
-
-    @ctx.room.on("participant_attributes_changed")
-    def on_participant_attributes_changed(
-        changed_attributes: dict[str, str], participant: rtc.Participant
-    ):
-        # check for attribute changes from the user itself
-        if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
-            return
-
-        if "voice" in changed_attributes:
-            voice_id = participant.attributes.get("voice")
-            logger.info(
-                f"participant {participant.identity} requested voice change: {voice_id}"
-            )
-            if not voice_id:
-                return
-
-            voice_data = next(
-                (voice for voice in cartesia_voices if voice["id"] == voice_id), None
-            )
-            if not voice_data:
-                logger.warning(f"Voice {voice_id} not found")
-                return
-            if "embedding" in voice_data:
-                model = "sonic-english"
-                language = "en"
-                if "language" in voice_data and voice_data["language"] != "en":
-                    language = voice_data["language"]
-                    model = "sonic-multilingual"
-                tts._opts.voice = voice_data["embedding"]
-                tts._opts.model = model
-                tts._opts.language = language
-                # allow user to confirm voice change as long as no one is speaking
-                if not (is_agent_speaking or is_user_speaking):
-                    asyncio.create_task(
-                        agent.say("How do I sound now?", allow_interruptions=True)
-                    )
-
-    await ctx.connect()
-
-    @agent.on("agent_started_speaking")
-    def agent_started_speaking():
-        nonlocal is_agent_speaking
-        is_agent_speaking = True
-
-    @agent.on("agent_stopped_speaking")
-    def agent_stopped_speaking():
-        nonlocal is_agent_speaking
-        is_agent_speaking = False
-
-    @agent.on("user_started_speaking")
-    def user_started_speaking():
-        nonlocal is_user_speaking
-        is_user_speaking = True
-
-    @agent.on("user_stopped_speaking")
-    def user_stopped_speaking():
-        nonlocal is_user_speaking
-        is_user_speaking = False
-
-    # set voice listing as attribute for UI
-    voices = []
-    for voice in cartesia_voices:
-        voices.append(
-            {
-                "id": voice["id"],
-                "name": voice["name"],
-            }
-        )
-    voices.sort(key=lambda x: x["name"])
-    await ctx.room.local_participant.set_attributes({"voices": json.dumps(voices)})
-
-    agent.start(ctx.room)
-    await agent.say("Hi there, how are you doing today?", allow_interruptions=True)
-
-
-if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+cli.runApp(new WorkerOptions({ agent: fileURLToPath(import.meta.url), workerType: JobType.JT_ROOM }));
